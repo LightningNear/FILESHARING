@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const CRC32 = require('crc-32');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const db = require('./db');
 
