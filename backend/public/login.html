@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Log In</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="card" style="max-width:540px;margin:40px auto;padding:20px;">
+  <h2>Log In</h2>
+  <label>User ID<br><input id="user" /></label><br><br>
+  <label>Password<br><input id="pass" type="password" /></label><br><br>
+  <button id="loginBtn">Log In</button>
+  <p id="msg"></p>
+</div>
+<script>
+document.getElementById('loginBtn').addEventListener('click', async () => {
+  const user = document.getElementById('user').value.trim();
+  const pass = document.getElementById('pass').value;
+  if(!user || !pass) { alert('Enter both fields'); return; }
+  const res = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user, pass }),
+    credentials: 'include'
+  });
+  const j = await res.json();
+  document.getElementById('msg').textContent = j.ok ? 'Logged in' : ('Error: ' + (j.error || JSON.stringify(j)));
+  if(j.ok){
+    sessionStorage.setItem('user', user);   // store per-tab
+    setTimeout(() => location.href='get-started.html', 500);
+  }
+});
+</script>
+
+</body>
+</html>

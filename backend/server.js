@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const CRC32 = require('crc-32');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt');
 const session = require('express-session');
 const db = require('./db');
 
@@ -42,12 +42,10 @@ app.use(session({
 app.use('/', express.static(path.join(__dirname, 'public')));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET","POST"] } });
-
+const io = new Server(server, { cors: { origin: "*", methods: ["GET","POST","DELETE"] } });
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
-
 
 // In-memory stores
 const WORKSPACES = {};   // room -> { creator, members:Set, transfers:Set, active }
@@ -55,10 +53,16 @@ const TRANSFERS = {};    // id -> info
 const USERSOCK = {};     // username -> socketId
 const ACK_TIMERS = {};   // transferId -> timeout
 
-
 // ---------- helpers ----------
 function ensureDir(d){ if(!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); }
 
+// normalizeName: keep everything before first ':' (if present), trim & lowercase
+function normalizeName(name){
+  if(!name) return '';
+  const trimmed = (''+name).trim();
+  const main = trimmed.split(':',1)[0];
+  return main.trim().toLowerCase();
+}
 
 function encryptAesGcm(buffer){
   const key = crypto.randomBytes(32);
@@ -79,7 +83,6 @@ function decryptAesGcm(payloadB64, keyB64, ivB64){
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
 }
-
 
 // Hamming (7,4) encode/decode (kept your original logic)
 function encodeNibbleTo7(n){
@@ -122,7 +125,6 @@ function hammingDecodeBuffer(encBuf){
   return { data: out };
 }
 
-
 function mimeFor(meta){
   if(meta.ftype === 'pdf') return 'application/pdf';
   if(meta.ftype === 'image'){
@@ -134,7 +136,6 @@ function mimeFor(meta){
   if(meta.ftype === 'video') return 'video/mp4';
   return 'application/octet-stream';
 }
-
 
 // ACK timer / retransmit (kept your behavior)
 function startAckTimer(id){
@@ -164,7 +165,6 @@ function retransmit(id){
   }catch(e){ console.error('retransmit error', e); }
 }
 
-
 // ---------- DB helpers ----------
 function createUser(username, passwordHash){
   return new Promise((resolve,reject)=>{
@@ -183,12 +183,7 @@ function findUser(username){
   });
 }
 
-
-// backend/server.js
-// ... your existing imports ...
-// (same as you pasted, just showing modified signup/login)
-
-
+// ---------- signup / login (unchanged) ----------
 app.post('/api/signup', async (req,res)=>{
   try{
     const { user, pass } = req.body;
@@ -205,7 +200,6 @@ app.post('/api/signup', async (req,res)=>{
   }
 });
 
-
 app.post('/api/login', async (req,res)=>{
   try{
     const { user, pass } = req.body;
@@ -213,14 +207,12 @@ app.post('/api/login', async (req,res)=>{
     const row = await findUser(user);
     if(!row) return res.status(400).json({ error:'no_user' });
 
-
     const stored = row.password || '';
     let ok = false;
     try {
       if(stored.startsWith('$2')) ok = await bcrypt.compare(pass, stored);
       else ok = (pass === stored);
     } catch(e) { ok = false; }
-
 
     if(!ok) return res.status(400).json({ error:'bad_pass' });
     req.session.user = user;
@@ -231,54 +223,119 @@ app.post('/api/login', async (req,res)=>{
   }
 });
 
-
-
 function requireLogin(req,res,next){ if(req.session && req.session.user) return next(); return res.status(401).json({ error:'auth' }); }
 
+// ---------- CREATE WORKSPACE (fixed: atomic case-insensitive + normalized_name) ----------
+app.post('/api/create-workspace', requireLogin, (req, res) => {
+  const { name } = req.body;
+  const creator = req.session.user;
 
-// ---------- Workspace endpoints ----------
-app.post('/api/create-workspace', requireLogin, (req,res)=>{
-  const { name } = req.body; const creator = req.session.user;
-  if(!name) return res.status(400).json({ error:'missing' });
+  if (!name) {
+    return res.status(400).json({ error: 'missing' });
+  }
 
+  const normalized = normalizeName(name);
 
-  db.get('SELECT id FROM workspaces WHERE name=?', [name], (err,row)=>{
-    if(err) return res.status(500).json({ error:'db_error' });
-    if(row) return res.status(400).json({ error:'exists' });
+  // Atomic conditional insert — prevents race conditions and enforces case-insensitive existence check
+  const sql = `
+    INSERT INTO workspaces (name, normalized_name, creator, active)
+    SELECT ?, ?, ?, 1
+    WHERE NOT EXISTS (
+      SELECT 1 FROM workspaces WHERE normalized_name = ? AND active = 1
+    )
+  `;
+  db.run(sql, [name, normalized, creator, normalized], function (err) {
+    if (err) {
+      console.error('DB insert error (create workspace):', err);
+      // fallback: unique constraint error
+      if (err.code === 'SQLITE_CONSTRAINT') return res.status(400).json({ error: 'name_taken' });
+      return res.status(500).json({ error: 'db_insert' });
+    }
+    // If no rows inserted, name already existed (case-insensitive)
+    if (this.changes === 0) {
+      return res.status(400).json({ error: 'name_taken' });
+    }
 
-
-    db.run('INSERT INTO workspaces (name,creator,active) VALUES (?,?,1)', [name,creator], function(err2){
-      if(err2) return res.status(500).json({ error:'db_insert' });
-      WORKSPACES[name] = { creator, members: new Set([creator]), transfers: new Set(), active:true };
-      return res.json({ ok:true, name, creator, members:[creator], active:true });
+    // success: ensure in-memory mirror uses exactly the stored name
+    // get the stored row to retrieve canonical name
+    db.get('SELECT * FROM workspaces WHERE id=?', [this.lastID], (err2, row) => {
+      if (err2 || !row) {
+        // weird but still return success to client
+        WORKSPACES[name] = { creator, members: new Set([creator]), transfers: new Set(), active: true };
+        return res.json({ ok: true, name, creator, members: [creator], active: true });
+      }
+      const canonical = row.name;
+      WORKSPACES[canonical] = { creator, members: new Set([creator]), transfers: new Set(), active: true };
+      return res.json({ ok: true, name: canonical, creator, members: [creator], active: true });
     });
   });
 });
 
+// ---------- End workspace API (keep old POST for compatibility) ----------
+function doEndWorkspaceByNameCaseInsensitive(name, user, cb) {
+  const normalized = normalizeName(name);
+  db.get('SELECT * FROM workspaces WHERE (lower(name)=lower(?) OR normalized_name = ?) AND active=1', [name, normalized], (err, row) => {
+    if (err) return cb(err);
+    if (!row) return cb(null, { ok: false, error: 'workspace_not_found' });
+    if (row.creator !== user) return cb(null, { ok: false, error: 'not_authorized' });
 
-app.post('/api/end-workspace', requireLogin, (req,res)=>{
-  const { name } = req.body; const user = req.session.user;
-  const ws = WORKSPACES[name];
-  if(!ws) return res.status(404).json({ error:'no_room' });
-  if(ws.creator !== user) return res.status(403).json({ error:'only_creator' });
-  db.run('UPDATE workspaces SET active=0 WHERE name=?', [name]);
-  io.to(name).emit('workspace_ended', { room: name });
-  delete WORKSPACES[name];
-  return res.json({ ok:true });
+    const realName = row.name;
+    db.run('UPDATE workspaces SET active=0 WHERE id=?', [row.id], (err2) => {
+      if (err2) return cb(err2);
+
+      // Remove transfers files if present in memory
+      const ws = WORKSPACES[realName];
+      if (ws) {
+        for (const tid of (ws.transfers || [])) {
+          const info = TRANSFERS[tid];
+          if (info) {
+            try { fs.rmSync(info.dir, { recursive: true, force: true }); } catch(e) {}
+            delete TRANSFERS[tid];
+          }
+        }
+        delete WORKSPACES[realName];
+      }
+
+      // notify members
+      io.to(realName).emit('workspace_ended', { room: realName });
+      return cb(null, { ok: true });
+    });
+  });
+}
+
+app.post('/api/end-workspace', requireLogin, (req, res) => {
+  const { name } = req.body;
+  const user = req.session.user;
+  doEndWorkspaceByNameCaseInsensitive(name, user, (err, result) => {
+    if (err) { console.error('end workspace error', err); return res.status(500).json({ error: 'server_error' }); }
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    return res.json({ ok: true });
+  });
 });
 
+// New: DELETE /api/workspace/:name (canonical, case-insensitive)
+app.delete('/api/workspace/:name', requireLogin, (req, res) => {
+  const name = req.params.name;
+  const user = req.session.user;
+  doEndWorkspaceByNameCaseInsensitive(name, user, (err, result) => {
+    if (err) { console.error('end workspace (DELETE) error', err); return res.status(500).json({ error: 'server_error' }); }
+    if (!result.ok) return res.status(400).json({ error: result.error });
+    return res.json({ ok: true });
+  });
+});
 
 // fetch workspace info — never returns null members
 app.get('/api/workspace/:name', requireLogin, (req,res)=>{
   const { name } = req.params;
-  db.get('SELECT * FROM workspaces WHERE name=? AND active=1', [name], (err,row)=>{
+  const normalized = normalizeName(name);
+  db.get('SELECT * FROM workspaces WHERE (lower(name)=lower(?) OR normalized_name = ?) AND active=1', [name, normalized], (err,row)=>{
     if(err) return res.status(500).json({ error:'db_error' });
     if(!row) return res.status(404).json({ error:'not_found' });
 
-
-    const ws = WORKSPACES[name];
+    const canonical = row.name;
+    const ws = WORKSPACES[canonical];
     return res.json({
-      name: row.name,
+      name: canonical,
       creator: row.creator,
       members: ws ? Array.from(ws.members) : [],
       active: !!row.active
@@ -286,8 +343,7 @@ app.get('/api/workspace/:name', requireLogin, (req,res)=>{
   });
 });
 
-
-// ---------- Upload endpoint ----------
+// ---------- Upload endpoint (unchanged core but normalized lookup) ----------
 app.post('/api/upload', requireLogin, upload.single('file'), (req,res)=>{
   try{
     const sender = req.session.user;
@@ -296,24 +352,22 @@ app.post('/api/upload', requireLogin, upload.single('file'), (req,res)=>{
     if(!file) return res.status(400).json({ error:'no file' });
     if(!room) return res.status(400).json({ error:'no room' });
 
+    const normalized = normalizeName(room);
 
     // check workspace exists & active in DB (so join/upload only if workspace created)
-    db.get('SELECT id,active FROM workspaces WHERE name=?', [room], (err,row)=>{
+    db.get('SELECT id,active,name FROM workspaces WHERE (lower(name)=lower(?) OR normalized_name = ?) AND active=1', [room, normalized], (err,row)=>{
       if(err) return res.status(500).json({ error:'db_error' });
       if(!row || !row.active) return res.status(400).json({ error:'no_room' });
 
-
-      if(!WORKSPACES[room]) WORKSPACES[room] = { creator: sender, members: new Set([sender]), transfers: new Set(), active:true };
-
+      const canonicalRoom = row.name;
+      if(!WORKSPACES[canonicalRoom]) WORKSPACES[canonicalRoom] = { creator: sender, members: new Set([sender]), transfers: new Set(), active:true };
 
       const id = crypto.randomUUID();
       const dir = path.join(UPLOAD_ROOT, id); ensureDir(dir);
       fs.writeFileSync(path.join(dir,'original.bin'), file.buffer);
 
-
       let processed = file.buffer;
       const meta = { originalName: fname || file.originalname, ftype: ftype || path.extname(file.originalname).slice(1) || 'bin' };
-
 
       if(meta.ftype === 'pdf'){
         const signed = CRC32.buf(processed) >>> 0;
@@ -323,42 +377,46 @@ app.post('/api/upload', requireLogin, upload.single('file'), (req,res)=>{
         if(meta.ftype === 'image') processed = hammingEncodeBuffer(processed);
       }
 
-
       const enc = encryptAesGcm(processed);
       fs.writeFileSync(path.join(dir,'encrypted.b64'), enc.payloadB64);
       fs.writeFileSync(path.join(dir,'meta.json'), JSON.stringify({ originalName: meta.originalName, ftype: meta.ftype, meta }, null, 2));
       fs.writeFileSync(path.join(dir,'key.json'), JSON.stringify({ key: enc.keyB64, iv: enc.ivB64 }));
 
+      TRANSFERS[id] = { id, dir, sender, recipient, room: canonicalRoom, meta, keyB64: enc.keyB64, ivB64: enc.ivB64, payloadB64: enc.payloadB64, attempts:0, status:'sent' };
+      WORKSPACES[canonicalRoom].transfers.add(id);
 
-      TRANSFERS[id] = { id, dir, sender, recipient, room, meta, keyB64: enc.keyB64, ivB64: enc.ivB64, payloadB64: enc.payloadB64, attempts:0, status:'sent' };
-      WORKSPACES[room].transfers.add(id);
+      // ✅ Emit logic
+      const payload = {
+        transferId: id,
+        filename: meta.originalName,
+        sender,
+        ftype: meta.ftype,
+        room: canonicalRoom,
+        recipient
+      };
 
-
-      // Emit to either specific recipient (if exists) or to whole room when recipient === 'all'
       if(recipient === 'all') {
-        io.to(room).emit('fileIncoming', { transferId: id, filename: meta.originalName, sender, ftype: meta.ftype, room, recipient: 'all' });
+        io.to(canonicalRoom).emit('fileIncoming', payload);
       } else {
+        // send to recipient if online
         if(USERSOCK[recipient]) {
-          io.to(USERSOCK[recipient]).emit('fileIncoming', { transferId: id, filename: meta.originalName, sender, ftype: meta.ftype, room, recipient });
-        } else {
-          // recipient offline -> still emit to room so receivers (when they join) can see? Keep simple: emit to room (they will ignore if not intended)
-          io.to(room).emit('fileIncoming', { transferId: id, filename: meta.originalName, sender, ftype: meta.ftype, room, recipient });
+          io.to(USERSOCK[recipient]).emit('fileIncoming', payload);
+        }
+        // always notify sender so they see their own file
+        if(USERSOCK[sender]) {
+          io.to(USERSOCK[sender]).emit('fileIncoming', payload);
         }
       }
 
-
       // notify sender of upload success
       const senderSid = USERSOCK[sender];
-      if(senderSid) io.to(senderSid).emit('uploadSuccess', { transferId:id, filename:meta.originalName, room });
-
+      if(senderSid) io.to(senderSid).emit('uploadSuccess', { transferId:id, filename:meta.originalName, room: canonicalRoom });
 
       // members update
-      io.to(room).emit('workspace_members', { members: Array.from(WORKSPACES[room].members) });
-
+      io.to(canonicalRoom).emit('workspace_members', { members: Array.from(WORKSPACES[canonicalRoom].members) });
 
       // start ack timer
       startAckTimer(id);
-
 
       return res.json({ ok:true, transferId:id, meta });
     });
@@ -367,7 +425,6 @@ app.post('/api/upload', requireLogin, upload.single('file'), (req,res)=>{
   }
 });
 
-
 // ---------- Fetch endpoint ----------
 app.get('/api/fetch/:id', requireLogin, (req,res)=>{
   try{
@@ -375,13 +432,11 @@ app.get('/api/fetch/:id', requireLogin, (req,res)=>{
     const info = TRANSFERS[id];
     if(!info) return res.status(404).json({ error:'not found' });
 
-
     // enforce access: sender or recipient (or 'all')
     const user = req.session.user;
     if(info.recipient && info.recipient !== 'all' && user !== info.recipient && user !== info.sender){
       return res.status(403).json({ error:'not_authorized' });
     }
-
 
     const payloadB64 = fs.readFileSync(path.join(info.dir,'encrypted.b64'), 'utf8').trim();
     let decrypted;
@@ -393,10 +448,8 @@ app.get('/api/fetch/:id', requireLogin, (req,res)=>{
       return res.status(500).json({ error:'decrypt_failed_retransmitting' });
     }
 
-
     const meta = info.meta;
     let valid=false, originalBuf=null;
-
 
     if(meta.ftype === 'pdf'){
       originalBuf = decrypted;
@@ -415,31 +468,26 @@ app.get('/api/fetch/:id', requireLogin, (req,res)=>{
       valid = (hash === meta.sha256);
     }
 
-
     if(!valid){
       retransmit(id);
       return res.status(400).json({ error:'verification_failed_retransmitting' });
     }
-
 
     clearAckTimer(id);
     info.status = 'delivered';
     io.to(info.room).emit('delivered', { transferId: id, recipient: user });
     if(info.sender && USERSOCK[info.sender]) io.to(USERSOCK[info.sender]).emit('delivered', { transferId: id, recipient: user });
 
-
     const mime = mimeFor(meta);
     res.setHeader('Content-Disposition', `inline; filename="${meta.originalName}"`);
     res.setHeader('Content-Type', mime);
     return res.send(originalBuf);
-
 
   }catch(e){
     console.error('fetch error', e);
     return res.status(500).json({ error:'server' });
   }
 });
-
 
 // ---------- Verify endpoint ----------
 app.post('/api/verify/:id', requireLogin, (req,res)=>{
@@ -457,11 +505,9 @@ app.post('/api/verify/:id', requireLogin, (req,res)=>{
   return res.json({ ok:true });
 });
 
-
 // ---------- Socket.IO ----------
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
-
 
   socket.on('register', (username) => {
     if(!username) return;
@@ -470,37 +516,68 @@ io.on('connection', (socket)=>{
     console.log('registered', username, socket.id);
   });
 
-
   socket.on('join_room', ({ room, username }) => {
-    if(!room || !username) return;
-    // Only allow joining if workspace exists & active in DB
-    db.get('SELECT id,active FROM workspaces WHERE name=?', [room], (err,row)=>{
-      if(err) { console.error('db err', err); socket.emit('join_failed', { reason: 'db_error' }); return; }
-      if(!row || !row.active) { socket.emit('join_failed', { reason: 'no_room' }); return; }
+    if (!room || !username) {
+      return socket.emit('join_failed', { reason: 'missing_params' });
+    }
 
+    const normalized = normalizeName(room);
 
-      socket.join(room);
-      if(!WORKSPACES[room]) WORKSPACES[room] = { creator: username, members: new Set([username]), transfers: new Set(), active:true };
-      else WORKSPACES[room].members.add(username);
-      io.to(room).emit('workspace_members', { members: Array.from(WORKSPACES[room].members) });
-      socket.emit('room_joined', { room });
-      console.log(username, 'joined', room);
+    // Case-insensitive lookup and fetch canonical row (supports both plain and :suffix forms)
+    db.get('SELECT * FROM workspaces WHERE (lower(name)=lower(?) OR normalized_name = ?) AND active=1', [room, normalized], (err, row) => {
+      if (err) {
+        console.error('DB error (join_room):', err);
+        return socket.emit('join_failed', { reason: 'db_error' });
+      }
+
+      if (!row) {
+        return socket.emit('join_failed', { reason: 'no_room' });
+      }
+
+      if (row.active !== 1) {
+        return socket.emit('join_failed', { reason: 'workspace_ended' });
+      }
+
+      const canonicalRoom = row.name;
+
+      // Join the canonical room
+      socket.join(canonicalRoom);
+
+      // Sync memory mirror with DB
+      if (!WORKSPACES[canonicalRoom]) {
+        WORKSPACES[canonicalRoom] = {
+          creator: row.creator,
+          members: new Set(),
+          transfers: new Set(),
+          active: true,
+        };
+      }
+
+      WORKSPACES[canonicalRoom].members.add(username);
+
+      // Emit updated member list to everyone in room
+      io.to(canonicalRoom).emit('workspace_members', {
+        room: canonicalRoom,
+        members: Array.from(WORKSPACES[canonicalRoom].members),
+      });
+
+      // Let the joiner know the canonical room name they actually joined
+      socket.emit('room_joined', { room: canonicalRoom });
+
+      console.log(`[JOIN] ${username} joined ${canonicalRoom}`);
     });
   });
-
 
   socket.on('leave_room', ({ room, username }) => {
     socket.leave(room);
     if(WORKSPACES[room]) { WORKSPACES[room].members.delete(username); io.to(room).emit('workspace_members', { members: Array.from(WORKSPACES[room].members) }); }
   });
 
-
   socket.on('disconnect', () => {
     for(const [u,sid] of Object.entries(USERSOCK)){ if(sid === socket.id) delete USERSOCK[u]; }
     console.log('socket disconnected', socket.id);
   });
 });
-
 
 // ---------- Start server ----------
 const PORT = process.env.PORT || 3000;

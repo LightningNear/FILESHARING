@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Workspace</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    body {
+      background: linear-gradient(to right, #6ee7b7, #3b82f6);
+      font-family: Arial, sans-serif;
+    }
+    .workspace-container {
+      width: 80%;
+      margin: 20px auto;
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+      overflow: hidden;
+    }
+    .workspace-header {
+      background: #3b82f6;
+      color: #fff;
+      padding: 12px;
+      font-weight: bold;
+      text-align: center;
+      font-size: 20px;
+    }
+    .workspace-body {
+      display: flex;
+      height: 420px;
+    }
+    .main-panel {
+      flex: 3;
+      background: #f9fafb;
+      padding: 12px;
+      overflow-y: auto;
+      border-right: 1px solid #ddd;
+    }
+    .side-panel {
+      flex: 1;
+      padding: 12px;
+      background: #f3f4f6;
+    }
+    .incoming-item {
+      background: #f1f5f9;
+      padding: 10px;
+      margin-bottom: 10px;
+      border-radius: 6px;
+      border: 1px solid #ddd;
+    }
+    .incoming-item b { color: #1e3a8a; }
+    .btn-view { background: #3b82f6; color: #fff; }
+    .btn-verify { background: #10b981; color: #fff; }
+    .btn-danger { background: #ef4444; color: #fff; }
+    .btn-send { background: #2563eb; color: #fff; }
+    .file-input {
+      padding: 15px;
+      background: #f1f5f9;
+      border-top: 1px solid #ddd;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .file-input input, .file-input select {
+      padding: 6px;
+      font-size: 14px;
+    }
+    #acknowledge { font-size: 14px; margin-top: 6px; color: green; font-weight: bold; }
+    #acknowledge.error { color: red; }
+    #pending { font-size: 13px; color: #555; }
+  </style>
+</head>
+<body>
+  <div class="workspace-container">
+    <div class="workspace-header" id="workspaceTitle">Workspace</div>
+
+    <div class="workspace-body">
+      <div class="main-panel" id="incoming-list"></div>
+      <div class="side-panel">
+        <p><b>Workspace Info</b></p>
+        <div id="userinfo"></div>
+        <button id="endBtn" class="btn btn-danger">End Workspace</button>
+        <hr>
+        <p><b>Pending / Incoming</b></p>
+        <div id="pending">No incoming files yet.</div>
+        <hr>
+        <p><b>Status</b></p>
+        <div id="acknowledge"></div>
+      </div>
+    </div>
+
+    <div class="file-input">
+      <!-- REPLACED: recipient textbox -> dropdown populated with members -->
+      <select id="recipient">
+        <option value="all">all</option>
+      </select>
+      <input type="text" id="fname" placeholder="File name (optional)" />
+      <select id="ftype">
+        <option value="pdf">PDF</option>
+        <option value="image">Image</option>
+        <option value="video">Video</option>
+      </select>
+      <input type="file" id="file" />
+      <button id="sendBtn" class="btn btn-send">Send</button>
+    </div>
+  </div>
+
+  <script>
+  (async function() {
+    const socket = io();
+
+    // Room & user resolution
+    const urlParams = new URLSearchParams(window.location.search);
+    let room = sessionStorage.getItem('room') || urlParams.get('room');
+    let username = sessionStorage.getItem('user');
+
+    if (urlParams.get('room')) {
+      sessionStorage.setItem('room', urlParams.get('room'));
+      room = urlParams.get('room');
+    }
+
+    if (!username || !room) {
+      alert('Missing user or workspace. Please login/create workspace first.');
+      window.location.href = '/index.html';
+      return;
+    }
+
+    // Update UI
+    document.getElementById("workspaceTitle").innerText = "Workspace: " + room;
+    document.getElementById("userinfo").innerText = "You: " + username + " · Room: " + room;
+
+    // Register + join
+    socket.emit("register", username);
+    socket.emit("join_room", { room, username });
+
+    socket.on('join_failed', (d) => {
+      alert('Failed to join workspace: ' + (d.reason || 'no_room'));
+      window.location.href = '/index.html';
+    });
+
+    socket.on('room_joined', (d) => {
+      if (d && d.room) {
+        sessionStorage.setItem('room', d.room);
+        room = d.room;
+        document.getElementById("workspaceTitle").innerText = "Workspace: " + room;
+        document.getElementById("userinfo").innerText = "You: " + username + " · Room: " + room;
+      }
+    });
+
+    // helper: populate recipient dropdown
+    function populateRecipientDropdown(members){
+      const sel = document.getElementById('recipient');
+      const prev = sel.value || 'all';
+      // clear but keep 'all' first
+      sel.innerHTML = '';
+      const optAll = document.createElement('option');
+      optAll.value = 'all';
+      optAll.innerText = 'all';
+      sel.appendChild(optAll);
+
+      // add members in sorted order (except the current user will still be present)
+      (members || []).sort().forEach(m => {
+        if(!m) return;
+        const o = document.createElement('option');
+        o.value = m;
+        o.innerText = m;
+        sel.appendChild(o);
+      });
+
+      // prefer to keep previously selected if still present
+      if(Array.from(sel.options).some(o=>o.value === prev)) sel.value = prev;
+    }
+
+    // Send button
+    document.getElementById("sendBtn").onclick = async () => {
+      const file = document.getElementById("file").files[0];
+      const recipient = document.getElementById("recipient").value || "all";
+      if (!file) { alert("Please select a file!"); return; }
+
+      const form = new FormData();
+      form.append("file", file);
+      form.append("recipient", recipient);
+      form.append("room", room);
+      form.append("ftype", document.getElementById("ftype").value);
+      form.append("fname", document.getElementById("fname").value);
+
+      const resp = await fetch("/api/upload", { method: "POST", body: form, credentials: 'include' });
+      const data = await resp.json();
+
+      if (!data.ok) {
+        document.getElementById("acknowledge").classList.add("error");
+        document.getElementById("acknowledge").innerText = "Upload failed: " + (data.error || "Unknown error");
+      } else {
+        document.getElementById("acknowledge").classList.remove("error");
+        document.getElementById("acknowledge").innerText = "Upload accepted: " + (data.meta?.originalName || data.transferId);
+      }
+    };
+
+    // Incoming files
+    function addFileItem(d, isSender) {
+      const label = isSender ? "You" : d.sender;
+      const role = isSender ? "sent" : "received";
+      const div = document.createElement("div");
+      div.className = "incoming-item";
+      div.innerHTML = `<b>${label}</b> ${role} <i>${d.filename || 'Unnamed'}</i> [${d.ftype || 'file'}]<br>
+        <button class="btn btn-view">View</button>
+        <button class="btn btn-verify">Verify</button>`;
+
+      div.querySelector(".btn-view").onclick = async () => {
+        const resp = await fetch(`/api/fetch/${d.transferId}`, { credentials: 'include' });
+        if (!resp.ok) { alert('Failed to load file'); return; }
+        const blob = await resp.blob();
+        const contentType = resp.headers.get('Content-Type') || '';
+        const url = URL.createObjectURL(blob);
+        if (contentType.includes('pdf')) {
+          const existingEmbed = div.querySelector('embed');
+          if (existingEmbed) existingEmbed.remove();
+          const embed = document.createElement('embed');
+          embed.src = url;
+          embed.type = 'application/pdf';
+          embed.width = '100%';
+          embed.height = '400px';
+          embed.style.marginTop = '10px';
+          div.appendChild(embed);
+        } else {
+          window.open(url, "_blank");
+        }
+      };
+
+      div.querySelector(".btn-verify").onclick = async () => {
+        const resp = await fetch(`/api/verify/${d.transferId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ valid: true }),
+          credentials: 'include'
+        });
+        div.innerHTML += resp.ok
+          ? "<br><span style='color:green'>Verified ✓</span>"
+          : "<br><span style='color:red'>Verify failed</span>";
+      };
+
+      document.getElementById("incoming-list").appendChild(div);
+    }
+
+    socket.on("fileIncoming", (d) => {
+      if ((d.recipient === 'all') || (d.recipient === username) || (d.sender === username)) {
+        const isSender = (d.sender === username);
+        addFileItem(d, isSender);
+        document.getElementById("pending").innerText = "New file received!";
+      }
+    });
+
+    socket.on("uploadSuccess", (d) => {
+      if (d?.filename) {
+        document.getElementById("acknowledge").classList.remove("error");
+        document.getElementById("acknowledge").innerText = "File sent successfully: " + d.filename;
+      }
+    });
+
+    // Update members dropdown when server sends the list
+    socket.on('workspace_members', (d) => {
+      if (!d) return;
+      const members = d.members || [];
+      populateRecipientDropdown(members);
+    });
+
+    // Also fetch workspace info on load to populate dropdown ASAP
+    try {
+      const resp = await fetch(`/api/workspace/${encodeURIComponent(room)}`, { credentials: 'include' });
+      if (resp.ok) {
+        const info = await resp.json();
+        if (info && Array.isArray(info.members)) {
+          populateRecipientDropdown(info.members);
+        }
+      }
+    } catch (e) {
+      // ignore - socket will update eventually
+    }
+
+    // End workspace
+    document.getElementById("endBtn").onclick = async () => {
+      if (!confirm("Are you sure you want to end this workspace?")) return;
+      try {
+        const resp = await fetch(`/api/workspace/${encodeURIComponent(room)}`, {
+          method: "DELETE",
+          credentials: 'include'
+        });
+        const data = await resp.json().catch(()=>({}));
+        if (resp.ok && data.ok) {
+          sessionStorage.removeItem("room");
+          alert("Workspace ended.");
+          window.location.href = "/get-started.html";
+        } else {
+          alert("Failed to end workspace: " + (data.error || resp.statusText || 'unknown'));
+        }
+      } catch (e) {
+        console.error(e);
+        alert("Error ending workspace.");
+      }
+    };
+
+    socket.on("workspace_ended", (d) => {
+      alert("Workspace '" + d.room + "' has ended.");
+      sessionStorage.removeItem("room");
+      window.location.href = "/get-started.html";
+    });
+
+  })();
+  </script>
+</body>
+</html>
